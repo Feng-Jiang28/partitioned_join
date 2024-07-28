@@ -26,6 +26,8 @@
 #include <thrust/sequence.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/distance.h>
+#include <thrust/sort.h>
+#include <thrust/set_operations.h>
 
 #include "nvtx_helper.cuh"
 #include "common.cuh"

@@ -14,6 +14,7 @@
 #include "nvtx_helper.cuh"
 #include <omp.h>
 #include "common.cuh"
+#include <thrust/sort.h>
 
 // the inner_join_cpu function performs an inner operation on two tables using either
 // unique keys or non-unique keys. check_results function verifies the correctness of
