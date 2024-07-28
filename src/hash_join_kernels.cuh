@@ -14,7 +14,7 @@
 #include <algorithm>
 #include "hash_functions.cuh"
 #include "common.cuh"
-#include "int_fastdiv.h"
+#include "../int_fastdiv/int_fastdiv.h"
 
 constexpr size_type BLOCK_SIZE_JOIN = 512;
 constexpr size_type UNUSED_VAL = -1;

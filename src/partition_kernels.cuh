@@ -15,7 +15,7 @@
 #include <cub/cub.cuh>
 #include "hash_functions.cuh"
 #include "common.cuh"
-#include "int_fastdiv.h"
+#include "../int_fastdiv/int_fastdiv.h"
 
 constexpr size_type BLOCK_SIZE_PARTITION = 512;
 constexpr size_type ELEM_PER_THREAD = 1024/BLOCK_SIZE_PARTITION;

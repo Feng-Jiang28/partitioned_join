@@ -15,7 +15,7 @@
 #include <cub/cub.cuh>
 #include "hash_functions.cuh"
 #include "common.cuh"
-#include "int_fastdiv.h"
+#include "../int_fastdiv/int_fastdiv.h"
 #include "hash_join_kernels.cuh"
 #include "partition_kernels.cuh"
 
