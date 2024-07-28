@@ -1,0 +1,6 @@
+[submodule "cub"]
+	path = cub
+	url = https://github.com/NVlabs/cub.git
+[submodule "int_fastdiv"]
+	path = int_fastdiv
+	url = https://github.com/milakov/int_fastdiv.git

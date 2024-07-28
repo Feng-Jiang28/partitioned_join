@@ -1,0 +1,3 @@
+*.o
+partitioned_join
+.vscode/

@@ -1,0 +1,740 @@
+/* Copyright 2019 NVIDIA Corporation.  All rights reserved.
+*
+* Please refer to the NVIDIA end user license agreement (EULA) associated
+* with this source code for terms and conditions that govern your use of
+* this software. Any use, reproduction, disclosure, or distribution of
+* this software and related documentation outside the terms of the EULA
+* is strictly prohibited.
+*/
+
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <curand.h>
+#include <getopt.h>
+#include <cuda_profiler_api.h>
+
+#include "src/partitioned_join.cuh"
+#include "src/generate_input_tables.cuh"
+#include "src/inner_join_cpu.hpp"
+#include "src/common.cuh"
+#include "src/skewed_data_handler.cuh"
+#include "src/generate_zipf_input.cuh"
+#include "src/nvtx_helper.cuh"
+
+constexpr size_t GIGABYTE = 1000000000;
+
+bool is_power_of_two(int x)
+{
+    return (x != 0) && ((x & (x - 1)) == 0);
+}
+
+int main (int argc, char** argv) {
+    // default arguments
+    size_type build_tbl_size = 1<<20;
+    size_type probe_tbl_size = 1<<20;
+    double selectivity = 0.03f;
+    int rand_max = build_tbl_size<<1;
+    bool uniq_build_tbl_keys = false; 
+    bool read_from_file = false; 
+    std::string build_tbl_file = ""; 
+    std::string probe_tbl_file = ""; 
+    int verbosity = 0;
+    bool radix_partition = false;   
+    int num_partitions_1 = -1;
+    int num_partitions_2 = -1;
+    long long device_memory_used = 0;
+    bool skip_cpu_run = false;
+    int output_size = -1; 
+    bool with_value = false;
+    bool csv = false;
+    int skewed_data_mode = 0; 
+    float zipf_factor = -1.0; 
+    float max_partition_size_factor = 3.0; 
+    bool do_combined_histo_pass = false;
+
+    // command line options
+    const option long_opts[] = {
+        {"build_tbl_size", required_argument, nullptr, 'b'},
+        {"probe_tbl_size", required_argument, nullptr, 'p'},
+        {"selectivity", required_argument, nullptr, 's'},
+        {"rand_max", required_argument, nullptr, 'r'},
+        {"uniq_build_tbl_keys", no_argument, nullptr, 'u'},
+        {"read_from_file", no_argument, nullptr, 'F'},
+        {"build_tbl_file", required_argument, nullptr, 'B'},
+        {"probe_tbl_file", required_argument, nullptr, 'P'},
+        {"verbosity", required_argument, nullptr, 'v'},
+        {"max_partition_size_factor", required_argument, nullptr, 'f'},
+        {"radix_partition", no_argument, nullptr, 'R'},
+        {"num_partitions_1", required_argument, nullptr, 'n'},
+        {"num_partitions_2", required_argument, nullptr, 'N'},
+        {"skip_cpu_run", required_argument, nullptr, 'S'},
+        {"with_value", no_argument, nullptr, 'V'},
+        {"csv", no_argument, nullptr, 'C'},
+        {"skewed_data_mode", required_argument, nullptr, 'Z'},
+        {"zipf_dist", required_argument, nullptr, 'z'},
+        {"do_combined_histogram_pass", required_argument, nullptr, 'H'}, 
+    };
+
+    const std::string opts_desc[] = {
+        "Build table size",
+        "Probe table size",
+        "Selectivity (ignored when -f is enabled)", 
+        "Maximum value of generated data (ignored when -f is enabled)", 
+        "Unique keys for build table", 
+        "Read from file (need to set -b, -p, -u, -B, and -P according to the files)", 
+        "Build table file path (ignored when -f is not enabled)", 
+        "Probe table file path (ignored when -f is not enabled)", 
+        "Verbosity level", 
+        "Factor controls the max partition size to further divide the large subsets to smaller ones \n \
+        size = <this factor> * ceil(build table size / number of partitions)",
+        "Use two-pass radix partition algorithm",
+        "Number of partitions for pass 1",
+        "Number of partitions for pass 2",
+        "Skip CPU reference run and sepecify the output size", 
+        "Add value columns to input tables", 
+        "Output results in csv format",
+        "Skewed data on [0: none, 1: build, 2: probe, 3: both]",
+        "Zipf factor for skewed data [0-1]", 
+        "Use combined histogram pass. When number of partition is small, this option may speedup the application. Only implemented with 4B key"
+    };
+
+    const std::string opts_default[] = {
+        std::to_string(build_tbl_size),
+        std::to_string(probe_tbl_size),
+        std::to_string(selectivity),
+        std::to_string(rand_max),
+        std::to_string(uniq_build_tbl_keys),
+        std::to_string(read_from_file),
+        build_tbl_file,
+        probe_tbl_file,
+        std::to_string(verbosity),
+        std::to_string(max_partition_size_factor),
+        std::to_string(radix_partition),
+        std::to_string(num_partitions_1),
+        std::to_string(num_partitions_2),
+        std::to_string(output_size),
+        std::to_string(with_value),
+        std::to_string(csv),
+        std::to_string(skewed_data_mode), 
+        std::to_string(zipf_factor),
+        std::to_string(do_combined_histo_pass),
+    };
+
+    // parse command line
+    int opt;
+    while ((opt = getopt_long(argc, argv, "b:p:s:r:uFB:P:v:f:Rn:N:S:VCZ:z:Hh", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'b': build_tbl_size = atoi(optarg); break;
+            case 'p': probe_tbl_size = atoi(optarg); break;
+            case 's': selectivity = atof(optarg); break;
+            case 'r': rand_max = atoi(optarg); break;
+            case 'u': uniq_build_tbl_keys = true; break;
+            case 'F': read_from_file = true; break;
+            case 'B': build_tbl_file = optarg; break;
+            case 'P': probe_tbl_file = optarg; break;
+            case 'v': verbosity = atoi(optarg); break;
+            case 'f': max_partition_size_factor = atof(optarg); break;
+            case 'R': radix_partition = true; break;
+            case 'n': num_partitions_1 = atoi(optarg); break;
+            case 'N': num_partitions_2 = atoi(optarg); break;
+            case 'S': skip_cpu_run = true; output_size = atoi(optarg); break;
+            case 'V': with_value = true; break;
+            case 'C': csv = true; break;
+            case 'Z': skewed_data_mode = atoi(optarg); break; 
+            case 'z': zipf_factor = atof(optarg); break; 
+            case 'H': do_combined_histo_pass = true; break; 
+            case 'h': {
+                std::cout << "Usage:" << std::endl;
+                int num_opts = std::extent<decltype(opts_desc)>::value;
+                for (int i = 0; i < num_opts; i++)
+                if (long_opts[i].has_arg != no_argument)
+                    std::cout << "  -" << (char)long_opts[i].val << ", --" << long_opts[i].name << " [arg]" << std::endl
+                    << "    " << opts_desc[i] << " [default: " << opts_default[i] << "]" << std::endl;
+                else
+                    std::cout << "  -" << (char)long_opts[i].val << ", --" << long_opts[i].name << std::endl
+                    << "    " << opts_desc[i] << " [default: " << std::boolalpha << opts_default[i] << "]" << std::endl;
+
+                exit(EXIT_FAILURE);
+            }
+            case '?':
+                std::cout << "Please use -h or --help for the list of options" << std::endl;
+                exit(EXIT_FAILURE);
+            default:
+                break;
+        }
+    }
+
+#ifdef USE_8B_KEYS 
+    if (do_combined_histo_pass) {
+        std::cerr << "Error: combined histo pass is not supported for 8B key. Disable -H." << std::endl;
+        return 1; 
+    }
+#endif 
+
+    int num_bits_1 = 0;
+    int num_bits_2 = 0;
+    if (!radix_partition && is_power_of_two(num_partitions_1)) {
+        num_bits_1 = std::log2(num_partitions_1);
+    }
+    else if (radix_partition && is_power_of_two(num_partitions_1) && is_power_of_two(num_partitions_2)) {
+        num_bits_1 = std::log2(num_partitions_1);
+        num_bits_2 = std::log2(num_partitions_2);
+    } else {
+        std::cerr << "Error: num_partition must be power of two." << std::endl;
+        return 1; 
+    }
+
+    int num_partitions = radix_partition ? num_partitions_1 * num_partitions_2 : num_partitions_1;
+    int num_partitions_max = std::max(num_partitions_1, num_partitions_2);
+
+    // input tables 
+    key_type* build_tbl = nullptr;
+    key_type* probe_tbl = nullptr;
+    CUDA_RT_CALL( cudaMalloc(&build_tbl, build_tbl_size * sizeof(key_type)) );
+    device_memory_used += build_tbl_size * sizeof(key_type); 
+    CUDA_RT_CALL( cudaMalloc(&probe_tbl, probe_tbl_size * sizeof(key_type)) );
+    device_memory_used += probe_tbl_size * sizeof(key_type);
+
+    value_type* build_tbl_val = nullptr;
+    value_type* probe_tbl_val = nullptr;
+    value_type* build_tbl_val_p = nullptr;
+    value_type* probe_tbl_val_p = nullptr;
+    if (with_value) {
+        CUDA_RT_CALL( cudaMalloc(&build_tbl_val, build_tbl_size * sizeof(value_type)) );
+        device_memory_used += build_tbl_size * sizeof(value_type); 
+        CUDA_RT_CALL( cudaMemset(build_tbl_val, 0, build_tbl_size * sizeof(value_type)) );
+        CUDA_RT_CALL( cudaMalloc(&probe_tbl_val, probe_tbl_size * sizeof(value_type)) );
+        device_memory_used += probe_tbl_size * sizeof(value_type);
+        CUDA_RT_CALL( cudaMemset(probe_tbl_val, 0, probe_tbl_size * sizeof(value_type)) );
+
+        CUDA_RT_CALL( cudaMalloc((void**)&build_tbl_val_p, build_tbl_size * sizeof(value_type)) );
+        device_memory_used += build_tbl_size * sizeof(value_type);
+        CUDA_RT_CALL( cudaMalloc((void**)&probe_tbl_val_p, probe_tbl_size * sizeof(value_type)) ); 
+        device_memory_used += probe_tbl_size * sizeof(value_type);    
+    }
+
+    if (read_from_file) {
+        key_type* build_tbl_read = nullptr;
+        key_type* probe_tbl_read = nullptr;
+        CUDA_RT_CALL( cudaMallocHost(&build_tbl_read, build_tbl_size * sizeof(key_type)) );
+        CUDA_RT_CALL( cudaMallocHost(&probe_tbl_read, probe_tbl_size * sizeof(key_type)) );
+        if (!csv) {
+            std::cout << "[*] Reading input tables" << std::endl;
+        }
+        // readFromFile(build_tbl_file.c_str(), build_tbl_read, build_tbl_size);
+        // readFromFile(probe_tbl_file.c_str(), probe_tbl_read, probe_tbl_size);
+        int* build_payload_read = nullptr; 
+        CUDA_RT_CALL( cudaMallocHost(&build_payload_read, build_tbl_size * sizeof(int)) );
+
+        // script for loading TPC-H Q4 data 
+        std::string lfile = "/scratch/local/rlan/sf10/lineitem.tbl"; 
+        std::string ofile = "/scratch/local/rlan/sf10/orders.tbl"; 
+        load_tpch_q4_data(lfile, ofile, probe_tbl_size, build_tbl_size, probe_tbl_read, build_tbl_read, build_payload_read); 
+
+        CUDA_RT_CALL( cudaMemcpy(build_tbl, build_tbl_read, build_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+        CUDA_RT_CALL( cudaMemcpy(probe_tbl, probe_tbl_read, probe_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+        CUDA_RT_CALL( cudaMemcpy(build_tbl_val, build_payload_read, build_tbl_size * sizeof(int), cudaMemcpyDefault) );
+
+        CUDA_RT_CALL( cudaFreeHost(build_tbl_read) ); 
+        CUDA_RT_CALL( cudaFreeHost(probe_tbl_read) ); 
+    } else {
+        if (skewed_data_mode != 0) {
+            // enforce selectivity to 1 
+            selectivity = 1; 
+            uniq_build_tbl_keys = skewed_data_mode == 2 ? true : false; 
+        }
+        if (!csv) {
+            std::cout << "[*] Generating input tables" << std::endl;
+        }
+        generate_input_tables<key_type, size_type>(build_tbl, build_tbl_size, probe_tbl, probe_tbl_size, selectivity, rand_max, uniq_build_tbl_keys);
+        // linear_sequence<key_type, size_type><<<1024, 256>>>(build_tbl, build_tbl_size); 
+        // linear_sequence<key_type, size_type><<<1024, 256>>>(probe_tbl, probe_tbl_size);     
+
+        // if (skewed_data_mode == 1 || skewed_data_mode == 3) {
+        //     if (!csv) {
+        //         std::cout << "[*] Generating skewed build table" << std::endl;
+        //     }
+        //     key_type* skewed_temp = nullptr; 
+        //     CUDA_RT_CALL( cudaMallocHost(&skewed_temp, build_tbl_size * sizeof(key_type)) );
+        //     gen_zipf<key_type>(build_tbl_size, rand_max, zipf_factor, skewed_temp);
+        //     CUDA_RT_CALL( cudaMemcpy(build_tbl, skewed_temp, build_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+        //     CUDA_RT_CALL( cudaFreeHost(skewed_temp) );  
+        // } 
+
+        // if (skewed_data_mode == 2 || skewed_data_mode == 3) {
+        //     if (!csv) {
+        //         std::cout << "[*] Generating skewed probe table" << std::endl;
+        //     }
+        //     key_type* skewed_temp = nullptr; 
+        //     CUDA_RT_CALL( cudaMallocHost(&skewed_temp, build_tbl_size * sizeof(key_type)) );
+        //     gen_zipf<key_type>(probe_tbl_size, rand_max, zipf_factor, skewed_temp);
+        //     CUDA_RT_CALL( cudaMemcpy(probe_tbl, skewed_temp, probe_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+        //     CUDA_RT_CALL( cudaFreeHost(skewed_temp) );  
+        // } 
+    }
+
+    float part_shared_memory_kb = 0;
+
+    if (csv) {
+        int tuple_byte = with_value ? sizeof(key_type) + sizeof(value_type) : sizeof(key_type);
+        std::cout << build_tbl_size << "," << probe_tbl_size << "," << sizeof(key_type) << "," << tuple_byte << "," << selectivity << "," << uniq_build_tbl_keys << "," << 
+            num_partitions_1 << "," << num_partitions_2 << "," << max_partition_size_factor << "," << skewed_data_mode << "," << zipf_factor << ",";
+    } else {
+        std::cout << "[*] Settings:" << std::endl; 
+        std::cout << "    build tabel size     = " << build_tbl_size << std::endl;
+        std::cout << "    probe tabel size     = " << probe_tbl_size << std::endl;
+        std::cout << "    has value col        = " << std::boolalpha << with_value << std::endl;
+        std::cout << "    skewed data mode     = " << skewed_data_mode << std::endl; 
+        if (skewed_data_mode != 0) {
+            std::cout << "    zipf factor          = " << zipf_factor << std::endl;     
+        }
+        if (read_from_file) {
+            std::cout << "    build table path     = " << build_tbl_file << std::endl;
+            std::cout << "    probe table path     = " << probe_tbl_file << std::endl;
+        } else {
+            std::cout << "    selectivity          = " << selectivity << std::endl;
+            std::cout << "    rand max             = " << rand_max << std::endl;
+        }
+        std::cout << "    uniq build tbl keys  = " << std::boolalpha << uniq_build_tbl_keys << std::endl;
+        std::cout << "    max part size factor = " << max_partition_size_factor << std::endl; 
+        std::cout << "    radix partition      = " << std::boolalpha << radix_partition << std::endl;
+        std::cout << "    num partitions P1    = " << num_partitions_1 << std::endl;
+        std::cout << "    num bits P1          = " << num_bits_1 << std::endl;
+        if (radix_partition) {
+            std::cout << "    num partitions P2    = " << num_partitions_2 << std::endl;
+            std::cout << "    num bits P2          = " << num_bits_2 << std::endl;    
+        }
+        std::cout << "    num partitions total = " << num_partitions << std::endl;
+        std::cout << "    sizeof(key_type)     = " << sizeof(key_type) << std::endl;
+        std::cout << "    sizeof(size_type)    = " << sizeof(size_type) << std::endl;
+        int partition_shared_mem_size = BLOCK_SIZE_PARTITION*N_UNROLL;
+        if (with_value) {
+            part_shared_memory_kb = (partition_shared_mem_size*sizeof(key_type)+
+                                    partition_shared_mem_size*sizeof(value_type)+num_partitions_max*sizeof(size_type)) / 1e3;
+            std::cout << "    sizeof(value_type)   = " << sizeof(value_type) << std::endl;
+        } else {
+            part_shared_memory_kb = (partition_shared_mem_size*sizeof(key_type)+num_partitions_max*sizeof(size_type)) / 1e3;
+        }
+        std::cout << "    partition shmem size = " << part_shared_memory_kb << " KB per block (estimated, lower bound)" << std::endl;
+        std::cout << "    join shmem size      = " << ceil(max_partition_size_factor * build_tbl_size / num_partitions)*sizeof(int2) / (HASH_TABLE_OCC*1e3) 
+                << " KB per block (estimated, lower bound)" << std::endl;
+        std::cout << "    skip CPU run         = " << std::boolalpha << skip_cpu_run << std::endl;    
+    }
+    
+    std::vector<key_type> build_tbl_h(build_tbl_size);
+    std::vector<key_type> probe_tbl_h(probe_tbl_size);
+    CUDA_RT_CALL( cudaMemcpy(build_tbl_h.data(), build_tbl, build_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+    CUDA_RT_CALL( cudaMemcpy(probe_tbl_h.data(), probe_tbl, probe_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+
+    if (verbosity > 2) {
+        std::cout << "====Build input table:" << std::endl;
+        for (int i = 0; i < build_tbl_size; ++i) {
+            std::cout << build_tbl_h[i] << " "; 
+        }
+        std::cout << std::endl << "====End" << std::endl;
+        std::cout << "====Probe input table:" << std::endl;
+        for (int i = 0; i < probe_tbl_size; ++i) {
+            std::cout << probe_tbl_h[i] << " "; 
+        }
+        std::cout << std::endl << "====End" << std::endl;
+    }
+
+    key_type* build_tbl_p = nullptr;
+    key_type* probe_tbl_p = nullptr;
+    CUDA_RT_CALL( cudaMalloc((void**)&build_tbl_p, build_tbl_size * sizeof(key_type)) );
+    device_memory_used += build_tbl_size * sizeof(key_type);
+    CUDA_RT_CALL( cudaMalloc((void**)&probe_tbl_p, probe_tbl_size * sizeof(key_type)) ); 
+    device_memory_used += probe_tbl_size * sizeof(key_type);
+
+    size_type* build_histo = nullptr;
+    size_type* probe_histo = nullptr;
+    size_type build_histo_size = num_partitions_1;
+    size_type probe_histo_size = num_partitions_1; 
+    CUDA_RT_CALL( cudaMalloc((void**)&build_histo, build_histo_size * sizeof(size_type)) );
+    device_memory_used += build_histo_size * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(build_histo, 0, build_histo_size * sizeof(size_type)) );
+    CUDA_RT_CALL( cudaMalloc((void**)&probe_histo, probe_histo_size * sizeof(size_type)) );
+    device_memory_used += probe_histo_size * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(probe_histo, 0, probe_histo_size * sizeof(size_type)) );
+
+    size_type* build_histo_s = nullptr;
+    size_type* probe_histo_s = nullptr;
+    CUDA_RT_CALL( cudaMalloc((void**)&build_histo_s, build_histo_size * sizeof(size_type)) );
+    device_memory_used += build_histo_size * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(build_histo_s, 0, build_histo_size * sizeof(size_type)) );
+    CUDA_RT_CALL( cudaMalloc((void**)&probe_histo_s, probe_histo_size * sizeof(size_type)) );
+    device_memory_used += probe_histo_size * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(probe_histo_s, 0, probe_histo_size * sizeof(size_type)) );
+
+    size_type* build_histo_p2 = nullptr;
+    size_type* probe_histo_p2 = nullptr;
+    size_type* build_histo_s_p2 = nullptr;
+    size_type* probe_histo_s_p2 = nullptr;
+    size_type build_histo_size_p2 = num_partitions;
+    size_type probe_histo_size_p2 = num_partitions;
+
+    if (radix_partition) {
+        CUDA_RT_CALL( cudaMalloc((void**)&build_histo_p2, build_histo_size_p2 * sizeof(size_type)) );
+        device_memory_used += build_histo_size_p2 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(build_histo_p2, 0, build_histo_size_p2 * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&probe_histo_p2, probe_histo_size_p2 * sizeof(size_type)) );
+        device_memory_used += probe_histo_size_p2 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(probe_histo_p2, 0, probe_histo_size_p2 * sizeof(size_type)) );
+
+        CUDA_RT_CALL( cudaMalloc((void**)&build_histo_s_p2, build_histo_size_p2 * sizeof(size_type)) );
+        device_memory_used += build_histo_size_p2 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(build_histo_s_p2, 0, build_histo_size_p2 * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&probe_histo_s_p2, probe_histo_size_p2 * sizeof(size_type)) );
+        device_memory_used += probe_histo_size_p2 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(probe_histo_s_p2, 0, probe_histo_size_p2 * sizeof(size_type)) );
+    }
+
+    // extra memory needed to handle skewed data for partition pass 2
+    size_type* partition_index_p2_build = nullptr, * partition_index_p2_probe = nullptr; 
+    size_type* partition_index_alt_p2_build = nullptr, * partition_index_alt_p2_probe = nullptr;
+    size_type* num_block_p2_build_h = nullptr, * num_block_p2_probe_h;
+    size_type* num_blocks_each_partition_p2_build = nullptr, * num_blocks_each_partition_p2_probe = nullptr;
+    size_type* num_blocks_each_partition_s_p2_build = nullptr, * num_blocks_each_partition_s_p2_probe = nullptr;
+
+    if (radix_partition) {
+        // over allocate as number of blocks needed may be larger than number of partitions  
+        int avg_elem_in_blk_build = ceil(1.0 * build_tbl_size / num_partitions_1);
+        int num_blk_per_part_build = ceil(1.0 * avg_elem_in_blk_build / (BLOCK_SIZE_PARTITION * N_UNROLL));
+        int num_block_p2_build = num_partitions_1 * num_blk_per_part_build;
+        CUDA_RT_CALL( cudaMalloc((void**)&partition_index_p2_build, num_block_p2_build * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+        device_memory_used += num_block_p2_build * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+        CUDA_RT_CALL( cudaMemset(partition_index_p2_build, 0, num_block_p2_build * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&partition_index_alt_p2_build, num_block_p2_build * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+        device_memory_used += num_block_p2_build * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+        CUDA_RT_CALL( cudaMemset(partition_index_alt_p2_build, 0, num_block_p2_build * sizeof(size_type)) );
+
+        int avg_elem_in_blk_probe = ceil(1.0 * probe_tbl_size / num_partitions_1);
+        int num_blk_per_part_probe = ceil(1.0 * avg_elem_in_blk_probe / (BLOCK_SIZE_PARTITION * N_UNROLL));
+        int num_block_p2_probe = num_partitions_1 * num_blk_per_part_probe;
+        CUDA_RT_CALL( cudaMalloc((void**)&partition_index_p2_probe, num_block_p2_probe * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+        device_memory_used += num_block_p2_probe * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+        CUDA_RT_CALL( cudaMemset(partition_index_p2_probe, 0, num_block_p2_probe * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&partition_index_alt_p2_probe, num_block_p2_probe * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+        device_memory_used += num_block_p2_probe * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+        CUDA_RT_CALL( cudaMemset(partition_index_alt_p2_probe, 0, num_block_p2_probe * sizeof(size_type)) );
+
+        CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition_p2_build, (num_partitions_1 + 1) * sizeof(size_type)) );
+        device_memory_used += num_partitions_1 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(num_blocks_each_partition_p2_build, 0, (num_partitions_1 + 1) * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition_s_p2_build, (num_partitions_1 + 1) * sizeof(size_type)) );
+        device_memory_used += num_partitions_1 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(num_blocks_each_partition_s_p2_build, 0, (num_partitions_1 + 1) * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition_p2_probe, (num_partitions_1 + 1) * sizeof(size_type)) );
+        device_memory_used += num_partitions_1 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(num_blocks_each_partition_p2_probe, 0, (num_partitions_1 + 1) * sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition_s_p2_probe, (num_partitions_1 + 1) * sizeof(size_type)) );
+        device_memory_used += num_partitions_1 * sizeof(size_type);
+        CUDA_RT_CALL( cudaMemset(num_blocks_each_partition_s_p2_probe, 0, (num_partitions_1 + 1) * sizeof(size_type)) );
+
+        CUDA_RT_CALL( cudaMallocHost((void**)&num_block_p2_build_h, sizeof(size_type)) );
+        CUDA_RT_CALL( cudaMallocHost((void**)&num_block_p2_probe_h, sizeof(size_type)) );
+    }
+
+    // extra memory needed to handle skewed data for join kernel 
+    size_type* partition_index = nullptr; 
+    size_type* partition_index_alt = nullptr;
+    // over allocate as number of blocks needed may be larger than number of partitions  
+    CUDA_RT_CALL( cudaMalloc((void**)&partition_index, num_partitions * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+    device_memory_used += num_partitions * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+    CUDA_RT_CALL( cudaMemset(partition_index, 0, num_partitions * sizeof(size_type)) );
+    CUDA_RT_CALL( cudaMalloc((void**)&partition_index_alt, num_partitions * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR) );
+    device_memory_used += num_partitions * sizeof(size_type) * DATA_SKEW_OVERALLOCATE_FACTOR;
+    CUDA_RT_CALL( cudaMemset(partition_index_alt, 0, num_partitions * sizeof(size_type)) );
+
+    size_type* num_blocks_each_partition = nullptr;
+    size_type* num_blocks_each_partition_s = nullptr;
+    CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition, (num_partitions + 1) * sizeof(size_type)) );
+    device_memory_used += num_partitions * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(num_blocks_each_partition, 0, (num_partitions + 1) * sizeof(size_type)) );
+    CUDA_RT_CALL( cudaMalloc((void**)&num_blocks_each_partition_s, (num_partitions + 1) * sizeof(size_type)) );
+    device_memory_used += num_partitions * sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(num_blocks_each_partition_s, 0, (num_partitions + 1) * sizeof(size_type)) );
+
+    size_type* num_block_join_h = nullptr;
+    CUDA_RT_CALL( cudaMallocHost((void**)&num_block_join_h, sizeof(size_type)) );
+
+    size_type joined_size = probe_tbl_size;
+    // reference CPU run 
+    std::vector<joined_type> joined_h;
+    double runtime_reference = -1; 
+
+    if (!skip_cpu_run) {
+        if (!csv) {
+            std::cout << "[*] Running on CPU" << std::endl;
+        }
+        joined_h.reserve(joined_size);
+        runtime_reference = inner_join_cpu(build_tbl_h, uniq_build_tbl_keys, probe_tbl_h, joined_h);
+        joined_size = std::max(1ul, joined_h.size());
+    } else {
+        if (!csv) {
+            std::cout << "[!] Warning: CPU run is skipped, using an estimated output size which may cause error." << std::endl;
+        }
+        joined_size = output_size;
+    }
+
+    joined_type* joined_tbl = nullptr;
+    CUDA_RT_CALL( cudaMalloc((void**)&joined_tbl, joined_size * sizeof(joined_type)) );
+    device_memory_used += joined_size * sizeof(joined_type);
+    CUDA_RT_CALL( cudaMemset(joined_tbl, 0, joined_size * sizeof(joined_type)) );
+
+    size_type *global_index = nullptr;
+    CUDA_RT_CALL( cudaMalloc((void**)&global_index, sizeof(size_type)) );
+    device_memory_used += sizeof(size_type);
+    CUDA_RT_CALL( cudaMemset(global_index, 0, sizeof(size_type)) );
+
+    void *temp_storage = NULL;
+    size_t temp_storage_bytes = 0, temp_storage_bytes_temp = 0;
+    cub::DeviceScan::ExclusiveSum(temp_storage, temp_storage_bytes_temp, build_histo, build_histo_s, build_histo_size);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::ExclusiveSum(temp_storage, temp_storage_bytes_temp, probe_histo, probe_histo_s, probe_histo_size);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::ExclusiveSum(temp_storage, temp_storage_bytes_temp, build_histo_p2, build_histo_s_p2, build_histo_size_p2);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::ExclusiveSum(temp_storage, temp_storage_bytes_temp, probe_histo_p2, probe_histo_s_p2, probe_histo_size_p2);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_temp, num_blocks_each_partition, num_blocks_each_partition_s, num_partitions + 1);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_temp, num_blocks_each_partition_p2_build, num_blocks_each_partition_s_p2_build, num_partitions_1 + 1);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_temp, num_blocks_each_partition_p2_probe, num_blocks_each_partition_s_p2_probe, num_partitions_1 + 1);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    cub::DeviceScan::InclusiveSum(temp_storage, temp_storage_bytes_temp, partition_index_alt, partition_index, num_partitions * DATA_SKEW_OVERALLOCATE_FACTOR);
+    temp_storage_bytes = std::max(temp_storage_bytes, temp_storage_bytes_temp);
+    CUDA_RT_CALL( cudaMalloc((void**)&temp_storage, temp_storage_bytes) );
+    device_memory_used += temp_storage_bytes;
+
+    if (!csv) {
+        std::cout << "[*] Running on GPU" << std::endl;
+    }
+
+    CUDA_RT_CALL( cudaProfilerStart() );
+
+    set_shared_memory_config(uniq_build_tbl_keys, with_value); 
+
+    float join_elapsed_ms = 0, combined_histo_elapsed_ms = 0, partition_one_elapsed_ms = 0, 
+        partition_two_elapsed_ms = 0, data_skew_handle_elapased_ms = 0, total_elapsed_ms = 0;
+
+    cudaEvent_t start, stop;
+
+    CUDA_RT_CALL( cudaEventCreate(&start) );
+    CUDA_RT_CALL( cudaEventCreate(&stop) );
+
+    size_type* join_build_global_histo = radix_partition ? build_histo_p2 : build_histo; 
+    size_type* join_probe_global_histo = radix_partition ? probe_histo_p2 : probe_histo; 
+
+    if (do_combined_histo_pass) {
+        CUDA_RT_CALL( cudaEventRecord(start, 0) );
+
+        combined_histogram_pass(
+            join_build_global_histo, build_histo, build_tbl, build_tbl_size, 
+            num_partitions, num_partitions_1, num_partitions_2, radix_partition
+        );
+    
+        combined_histogram_pass(
+            join_probe_global_histo, probe_histo, probe_tbl, probe_tbl_size, 
+            num_partitions, num_partitions_1, num_partitions_2, radix_partition
+        );
+
+        CUDA_RT_CALL( cudaEventRecord(stop, 0) );
+        CUDA_RT_CALL( cudaEventSynchronize(stop) );
+        CUDA_RT_CALL( cudaEventElapsedTime(&combined_histo_elapsed_ms, start, stop) );
+    }
+
+    CUDA_RT_CALL( cudaEventRecord(start, 0) );
+
+    partition_input_tables_pass_one<key_type, size_type, value_type>(
+        build_tbl_p, build_tbl_val_p, build_histo, build_histo_s, build_histo_size, build_tbl, 
+        build_tbl_val, build_tbl_size, num_partitions_1, temp_storage, temp_storage_bytes, with_value, num_bits_2, do_combined_histo_pass
+    );
+
+    partition_input_tables_pass_one<key_type, size_type, value_type>(
+        probe_tbl_p, probe_tbl_val_p, probe_histo, probe_histo_s, probe_histo_size, probe_tbl, 
+        probe_tbl_val, probe_tbl_size, num_partitions_1, temp_storage, temp_storage_bytes, with_value, num_bits_2, do_combined_histo_pass
+    );
+
+    CUDA_RT_CALL( cudaEventRecord(stop, 0) );
+    CUDA_RT_CALL( cudaEventSynchronize(stop) );
+    CUDA_RT_CALL( cudaEventElapsedTime(&partition_one_elapsed_ms, start, stop) );
+
+    if (radix_partition) {
+        // partition pass two     
+        CUDA_RT_CALL( cudaEventRecord(start, 0) );
+
+        int num_unroll = with_value ? N_UNROLL_W_VAL : N_UNROLL; 
+
+        handle_skewed_data<size_type>(
+            build_histo, build_tbl_size, BLOCK_SIZE_PARTITION * num_unroll, 
+            num_partitions_1, partition_index_p2_build, partition_index_alt_p2_build, 
+            num_blocks_each_partition_p2_build, num_blocks_each_partition_s_p2_build, num_block_p2_build_h, 
+            temp_storage, temp_storage_bytes
+        ); 
+
+        partition_input_tables_pass_two<key_type, size_type, value_type>(
+            build_tbl, build_tbl_val, build_histo_p2, build_histo_s_p2, build_histo_size_p2, build_tbl_p, 
+            build_tbl_val_p, build_tbl_size, num_partitions_1, num_partitions_2, num_blocks_each_partition_s_p2_build, 
+            partition_index_p2_build, *num_block_p2_build_h, temp_storage, 
+            temp_storage_bytes, build_histo, with_value, do_combined_histo_pass
+        );
+
+        handle_skewed_data<size_type>(
+            probe_histo, probe_tbl_size, BLOCK_SIZE_PARTITION * num_unroll, 
+            num_partitions_1, partition_index_p2_probe, partition_index_alt_p2_probe, 
+            num_blocks_each_partition_p2_probe, num_blocks_each_partition_s_p2_probe, num_block_p2_probe_h, 
+            temp_storage, temp_storage_bytes
+        ); 
+
+        partition_input_tables_pass_two<key_type, size_type, value_type>(
+            probe_tbl, probe_tbl_val, probe_histo_p2, probe_histo_s_p2, probe_histo_size_p2, probe_tbl_p, 
+            probe_tbl_val_p, probe_tbl_size, num_partitions_1, num_partitions_2, num_blocks_each_partition_s_p2_probe, 
+            partition_index_p2_probe, *num_block_p2_probe_h, temp_storage, 
+            temp_storage_bytes, probe_histo, with_value, do_combined_histo_pass
+        );
+
+        CUDA_RT_CALL( cudaEventRecord(stop, 0) );
+        CUDA_RT_CALL( cudaEventSynchronize(stop) );
+        CUDA_RT_CALL( cudaEventElapsedTime(&partition_two_elapsed_ms, start, stop) );
+    }
+
+    // handle skewed data 
+    CUDA_RT_CALL( cudaEventRecord(start, 0) );
+    key_type* join_build_tbl = radix_partition ? build_tbl : build_tbl_p; 
+    key_type* join_probe_tbl = radix_partition ? probe_tbl : probe_tbl_p; 
+    value_type* join_build_tbl_val = radix_partition ? build_tbl_val : build_tbl_val_p; 
+    value_type* join_probe_tbl_val = radix_partition ? probe_tbl_val : probe_tbl_val_p; 
+
+    // factor to make each block handle more build table data 
+    size_type base_build_tbl_size_each_part = ceil(max_partition_size_factor * build_tbl_size / num_partitions); 
+
+    handle_skewed_data<size_type>(
+        join_build_global_histo, build_tbl_size, base_build_tbl_size_each_part, 
+        num_partitions, partition_index, partition_index_alt, 
+        num_blocks_each_partition, num_blocks_each_partition_s, num_block_join_h, 
+        temp_storage, temp_storage_bytes
+    );
+
+    CUDA_RT_CALL( cudaEventRecord(stop, 0) );
+    CUDA_RT_CALL( cudaEventSynchronize(stop) );
+    CUDA_RT_CALL( cudaEventElapsedTime(&data_skew_handle_elapased_ms, start, stop) );
+
+    // join 
+    CUDA_RT_CALL( cudaEventRecord(start, 0) );
+    shared_memory_hash_join<key_type, size_type, value_type, joined_type>(
+        joined_tbl, join_build_tbl, join_build_tbl_val, build_tbl_size, 
+        join_probe_tbl, join_probe_tbl_val, probe_tbl_size, 
+        base_build_tbl_size_each_part, 
+        global_index, num_blocks_each_partition_s, partition_index, *num_block_join_h,
+        num_partitions, uniq_build_tbl_keys, join_build_global_histo, join_probe_global_histo, 
+        with_value, joined_size
+    );
+    CUDA_RT_CALL( cudaEventRecord(stop, 0) );
+    CUDA_RT_CALL( cudaEventSynchronize(stop) );
+    CUDA_RT_CALL( cudaEventElapsedTime(&join_elapsed_ms, start, stop) );
+    CUDA_RT_CALL( cudaProfilerStop() );
+
+    total_elapsed_ms = join_elapsed_ms + combined_histo_elapsed_ms 
+        + data_skew_handle_elapased_ms + partition_one_elapsed_ms + partition_two_elapsed_ms; 
+
+    key_type* build_tbl_pinned = nullptr;
+    key_type* probe_tbl_pinned = nullptr;
+    joined_type* joined_tbl_pinned = nullptr;
+        
+    CUDA_RT_CALL( cudaMallocHost((void**)&build_tbl_pinned, build_tbl_size * sizeof(key_type)) );
+    CUDA_RT_CALL( cudaMallocHost((void**)&probe_tbl_pinned, probe_tbl_size * sizeof(key_type)) );
+    CUDA_RT_CALL( cudaMallocHost((void**)&joined_tbl_pinned, joined_size * sizeof(joined_type)) );
+
+    CUDA_RT_CALL( cudaMemcpy(build_tbl_pinned, build_tbl, build_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+    CUDA_RT_CALL( cudaMemcpy(probe_tbl_pinned, probe_tbl, probe_tbl_size * sizeof(key_type), cudaMemcpyDefault) );
+    CUDA_RT_CALL( cudaMemcpy(joined_tbl_pinned, joined_tbl, joined_size * sizeof(joined_type), cudaMemcpyDefault) );
+
+    int num_errors = -1;
+    if (!skip_cpu_run) {
+        num_errors = check_results(
+            joined_tbl_pinned, joined_size, build_tbl_pinned, build_tbl_size, 
+            probe_tbl_pinned, probe_tbl_size, joined_h, build_tbl_h, probe_tbl_h, verbosity
+        );
+    }
+
+    // print result
+    if (csv) {
+        std::cout << joined_size << "," << combined_histo_elapsed_ms << "," 
+        << partition_one_elapsed_ms << "," << partition_two_elapsed_ms << ","
+        << data_skew_handle_elapased_ms << "," <<  join_elapsed_ms << "," 
+        << total_elapsed_ms << "," << num_errors << std::endl;
+    } else {
+        std::cout << "[*] Results:" << std::endl;
+        std::cout << "    joined size          = " << joined_size << std::endl;
+        if (do_combined_histo_pass) {
+            std::cout << "    combined histogram time    = " << std::setprecision(3) << combined_histo_elapsed_ms << " ms" << std::endl;
+        }
+        std::cout << "    partition P1 time    = " << std::setprecision(3) << partition_one_elapsed_ms << " ms" << std::endl;
+        if (radix_partition) {
+            std::cout << "    partition P2 time    = " << std::setprecision(3) << partition_two_elapsed_ms << " ms" << std::endl;
+        }
+        std::cout << "    skewed data time     = " << std::setprecision(3) << data_skew_handle_elapased_ms << " ms" << std::endl;
+        std::cout << "    join phase time      = " << std::setprecision(3) << join_elapsed_ms << " ms" << std::endl;
+        std::cout << "    total exec time      = " << std::setprecision(3) << total_elapsed_ms << " ms" << std::endl;
+        long long input_size = with_value ? ((probe_tbl_size + build_tbl_size)*(sizeof(key_type) + sizeof(value_type)))
+                                : ((probe_tbl_size + build_tbl_size)*sizeof(key_type));
+        std::cout << "    effective BW         = " << input_size/(total_elapsed_ms/1000*GIGABYTE) << " GB/s" << std::endl;
+        std::cout << "    device memory usage  = " << device_memory_used / 1e9 << " GB" << std::endl;
+        if (!skip_cpu_run) {
+            std::cout << "    reference CPU time   = " << std::setprecision(5) << 1000.0 * runtime_reference << " ms" << std::endl;
+            std::cout << "    number of errors     = " << num_errors << std::endl;
+        } else {
+            std::cout << "    reference CPU time   = SKIPPED" << std::endl;
+            std::cout << "    number of errors     = SKIPPED" << std::endl;
+        }
+    }
+
+    // free
+    CUDA_RT_CALL( cudaFree(build_tbl) );
+    CUDA_RT_CALL( cudaFree(probe_tbl) );
+    CUDA_RT_CALL( cudaFree(build_tbl_p) );
+    CUDA_RT_CALL( cudaFree(probe_tbl_p) );
+    CUDA_RT_CALL( cudaFree(build_histo) );
+    CUDA_RT_CALL( cudaFree(probe_histo) );
+    CUDA_RT_CALL( cudaFree(build_histo_s) );
+    CUDA_RT_CALL( cudaFree(probe_histo_s) );
+    if (radix_partition) {
+        CUDA_RT_CALL( cudaFree(build_histo_p2) );
+        CUDA_RT_CALL( cudaFree(probe_histo_p2) );
+        CUDA_RT_CALL( cudaFree(build_histo_s_p2) );
+        CUDA_RT_CALL( cudaFree(probe_histo_s_p2) );
+        CUDA_RT_CALL( cudaFree(partition_index_p2_build) );
+        CUDA_RT_CALL( cudaFree(partition_index_p2_probe) );
+        CUDA_RT_CALL( cudaFree(partition_index_alt_p2_build) );
+        CUDA_RT_CALL( cudaFree(partition_index_alt_p2_probe) );
+        CUDA_RT_CALL( cudaFree(num_blocks_each_partition_p2_build) );
+        CUDA_RT_CALL( cudaFree(num_blocks_each_partition_p2_probe) );
+        CUDA_RT_CALL( cudaFree(num_blocks_each_partition_s_p2_build) );
+        CUDA_RT_CALL( cudaFree(num_blocks_each_partition_s_p2_probe) );
+        CUDA_RT_CALL( cudaFreeHost(num_block_p2_build_h) );
+        CUDA_RT_CALL( cudaFreeHost(num_block_p2_probe_h) );
+    }
+    if (with_value) {
+        CUDA_RT_CALL( cudaFree(build_tbl_val) );
+        CUDA_RT_CALL( cudaFree(probe_tbl_val) );
+        CUDA_RT_CALL( cudaFree(build_tbl_val_p) );
+        CUDA_RT_CALL( cudaFree(probe_tbl_val_p) );
+    }
+    CUDA_RT_CALL( cudaFree(joined_tbl) );
+    CUDA_RT_CALL( cudaFree(temp_storage) );
+    CUDA_RT_CALL( cudaFree(global_index) );
+    CUDA_RT_CALL( cudaFreeHost(build_tbl_pinned) );
+    CUDA_RT_CALL( cudaFreeHost(probe_tbl_pinned) );
+    CUDA_RT_CALL( cudaFreeHost(joined_tbl_pinned) );
+
+    CUDA_RT_CALL( cudaFree(partition_index) );
+    CUDA_RT_CALL( cudaFree(partition_index_alt) );
+    CUDA_RT_CALL( cudaFree(num_blocks_each_partition) );
+    CUDA_RT_CALL( cudaFree(num_blocks_each_partition_s) );
+    CUDA_RT_CALL( cudaFreeHost(num_block_join_h) );
+
+    return 0; 
+}
