@@ -1,5 +1,0 @@
-tdigest
-=======
-
-.. doxygengroup:: tdigest
-   :members:

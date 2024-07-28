@@ -1,3 +1,0 @@
-source @Thrust_SOURCE_DIR@/scripts/gdb-pretty-printers.py
-source @rmm_SOURCE_DIR@/scripts/gdb-pretty-printers.py
-source @PROJECT_SOURCE_DIR@/scripts/gdb-pretty-printers.py
