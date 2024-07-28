@@ -1,0 +1,29 @@
+#cpp code owners
+cpp/                 @rapidsai/cudf-cpp-codeowners
+python/cudf/udf_cpp/ @rapidsai/cudf-cpp-codeowners
+
+#python code owners
+python/            @rapidsai/cudf-python-codeowners
+notebooks/         @rapidsai/cudf-python-codeowners
+python/dask_cudf/  @rapidsai/cudf-dask-codeowners
+
+#cmake code owners
+cpp/CMakeLists.txt               @rapidsai/cudf-cmake-codeowners
+cpp/libcudf_kafka/CMakeLists.txt @rapidsai/cudf-cmake-codeowners
+**/cmake/                        @rapidsai/cudf-cmake-codeowners
+*.cmake                          @rapidsai/cudf-cmake-codeowners
+
+#java code owners
+java/              @rapidsai/cudf-java-codeowners
+
+#CI code owners
+/.github/                @rapidsai/ci-codeowners
+/ci/                     @rapidsai/ci-codeowners
+/.pre-commit-config.yaml @rapidsai/ci-codeowners
+
+#packaging code owners
+/.devcontainers/   @rapidsai/packaging-codeowners
+/conda/            @rapidsai/packaging-codeowners
+/dependencies.yaml @rapidsai/packaging-codeowners
+/build.sh          @rapidsai/packaging-codeowners
+pyproject.toml     @rapidsai/packaging-codeowners

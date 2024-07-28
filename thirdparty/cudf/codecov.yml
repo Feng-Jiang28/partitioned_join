@@ -1,0 +1,12 @@
+#Configuration File for CodeCov
+coverage:
+  status:
+    project: off
+    patch:
+      default:
+        target: auto
+        threshold: 5%
+        informational: true  # The coverage will always pass
+
+github_checks:
+    annotations: true
